@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/gin-contrib/sse"
 	"github.com/gin-gonic/gin"
@@ -132,6 +134,54 @@ func WriteSSEStreamWithErrorFormatter(c *gin.Context, stream streams.Stream[*htt
 	c.Header("Connection", "keep-alive")
 	c.Writer.Flush()
 
+	isAnthropic := detectStreamFormat(c) == StreamFormatAnthropic
+	isOpenAI := detectStreamFormat(c) == StreamFormatOpenAI
+	heartbeatTimeout := 9 * time.Second
+	heartbeatStop := make(chan struct{})
+	heartbeatReset := make(chan time.Time)
+	var heartbeatTimer *time.Timer
+	var heartbeatDataFunc func() string
+
+	connClosed := c.Writer.CloseNotify()
+
+	heartbeatDataFunc = func() string {
+		if isAnthropic {
+			return `{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":""}}`
+		}
+		if isOpenAI {
+			return ``
+		}
+		return ""
+	}
+
+	heartbeatTimer = time.NewTimer(heartbeatTimeout)
+	go func() {
+		for {
+			select {
+			case <-heartbeatStop:
+				return
+			case <-connClosed:
+				return
+			case <-heartbeatTimer.C:
+				heartbeatData := heartbeatDataFunc()
+				eventType := "message_delta"
+				if isOpenAI {
+					eventType = ""
+				} else if !isAnthropic && !isOpenAI {
+					eventType = ""
+				}
+				if isAnthropic {
+					c.SSEvent(eventType, heartbeatData)
+				}
+				log.Warn(ctx, "write heartbeat event")
+				c.Writer.Flush()
+				heartbeatTimer.Reset(heartbeatTimeout)
+			case <-heartbeatReset:
+				heartbeatTimer.Reset(heartbeatTimeout)
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -139,6 +189,7 @@ func WriteSSEStreamWithErrorFormatter(c *gin.Context, stream streams.Stream[*htt
 
 			log.Warn(ctx, "Context done, stopping stream")
 
+			close(heartbeatStop)
 			return
 		default:
 			if stream.Next() {
@@ -146,6 +197,8 @@ func WriteSSEStreamWithErrorFormatter(c *gin.Context, stream streams.Stream[*htt
 				c.SSEvent(cur.Type, cur.Data)
 				log.Debug(ctx, "write stream event", log.Any("event", cur))
 				c.Writer.Flush()
+
+				heartbeatReset <- time.Now()
 			} else {
 				if stream.Err() != nil {
 					log.Error(ctx, "Error in stream", log.Cause(stream.Err()))
@@ -154,6 +207,7 @@ func WriteSSEStreamWithErrorFormatter(c *gin.Context, stream streams.Stream[*htt
 
 				c.Writer.Flush()
 
+				close(heartbeatStop)
 				return
 			}
 		}
@@ -208,4 +262,23 @@ func FormatStreamError(_ context.Context, err error) any {
 		},
 		"request_id": requestID,
 	}
+}
+
+type StreamFormat string
+
+const (
+	StreamFormatOpenAI    StreamFormat = "openai"
+	StreamFormatAnthropic StreamFormat = "anthropic"
+	StreamFormatGemini    StreamFormat = "gemini"
+)
+
+func detectStreamFormat(c *gin.Context) StreamFormat {
+	path := c.Request.URL.Path
+	if strings.Contains(path, "/anthropic/") {
+		return StreamFormatAnthropic
+	}
+	if strings.Contains(path, "/gemini/") {
+		return StreamFormatGemini
+	}
+	return StreamFormatOpenAI
 }
