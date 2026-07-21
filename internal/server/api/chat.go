@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-contrib/sse"
 	"github.com/gin-gonic/gin"
@@ -21,6 +23,7 @@ import (
 const (
 	errTypeQuotaExhausted = "quota_exhausted"
 	errCodeQuotaExhausted = "quota_exhausted"
+	sseHeartbeatTimeout   = 9 * time.Second
 )
 
 // StreamWriter is a function type for writing stream events to the response.
@@ -118,6 +121,11 @@ func (handlers *ChatCompletionHandlers) ChatCompletionWithRequest(c *gin.Context
 // StreamErrorFormatter formats a stream error into a JSON-serializable object for SSE error events.
 type StreamErrorFormatter func(ctx context.Context, err error) any
 
+type streamPumpResult struct {
+	event *httpclient.StreamEvent
+	err   error
+}
+
 // WriteSSEStream writes stream events as Server-Sent Events (SSE) with default error formatting.
 func WriteSSEStream(c *gin.Context, stream streams.Stream[*httpclient.StreamEvent]) {
 	WriteSSEStreamWithErrorFormatter(c, stream, FormatStreamError)
@@ -144,6 +152,34 @@ func WriteSSEStreamWithErrorFormatter(c *gin.Context, stream streams.Stream[*htt
 	c.Header("Connection", "keep-alive")
 	c.Writer.Flush()
 
+	pumpCtx, stopPump := context.WithCancel(ctx)
+	defer stopPump()
+
+	pumpResults := make(chan streamPumpResult)
+	go func() {
+		defer close(pumpResults)
+
+		for stream.Next() {
+			current := stream.Current()
+			event := *current
+			event.Data = bytes.Clone(current.Data)
+
+			select {
+			case pumpResults <- streamPumpResult{event: &event}:
+			case <-pumpCtx.Done():
+				return
+			}
+		}
+
+		select {
+		case pumpResults <- streamPumpResult{err: stream.Err()}:
+		case <-pumpCtx.Done():
+		}
+	}()
+
+	heartbeatTimer := time.NewTimer(sseHeartbeatTimeout)
+	defer heartbeatTimer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -152,22 +188,46 @@ func WriteSSEStreamWithErrorFormatter(c *gin.Context, stream streams.Stream[*htt
 			log.Warn(ctx, "Context done, stopping stream")
 
 			return
-		default:
-			if stream.Next() {
-				cur := stream.Current()
-				c.SSEvent(cur.Type, cur.Data)
-				log.Debug(ctx, "write stream event", log.Any("event", cur))
+		case <-heartbeatTimer.C:
+			if _, err := c.Writer.Write([]byte(": ping\n\n")); err != nil {
+				clientDisconnected = true
+				log.Warn(ctx, "Failed to write stream heartbeat", log.Cause(err))
+
+				return
+			}
+
+			c.Writer.Flush()
+			heartbeatTimer.Reset(sseHeartbeatTimeout)
+		case result, ok := <-pumpResults:
+			if !ok {
 				c.Writer.Flush()
-			} else {
-				if stream.Err() != nil {
-					log.Error(ctx, "Error in stream", log.Cause(stream.Err()))
-					c.SSEvent("error", formatErr(ctx, stream.Err()))
+
+				return
+			}
+
+			if result.event == nil {
+				if result.err != nil {
+					log.Error(ctx, "Error in stream", log.Cause(result.err))
+					c.SSEvent("error", formatErr(ctx, result.err))
 				}
 
 				c.Writer.Flush()
 
 				return
 			}
+
+			c.SSEvent(result.event.Type, result.event.Data)
+			log.Debug(ctx, "write stream event", log.Any("event", result.event))
+			c.Writer.Flush()
+
+			if !heartbeatTimer.Stop() {
+				select {
+				case <-heartbeatTimer.C:
+				default:
+				}
+			}
+
+			heartbeatTimer.Reset(sseHeartbeatTimeout)
 		}
 	}
 }

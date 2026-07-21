@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -111,6 +114,61 @@ type failingResponseWriter struct {
 	writes int
 }
 
+type contextBlockingStream struct {
+	ctx          context.Context
+	nextReturned chan struct{}
+}
+
+func (s *contextBlockingStream) Next() bool {
+	<-s.ctx.Done()
+	if s.nextReturned != nil {
+		close(s.nextReturned)
+	}
+
+	return false
+}
+
+func (s *contextBlockingStream) Current() *httpclient.StreamEvent { return nil }
+func (s *contextBlockingStream) Err() error                       { return nil }
+func (s *contextBlockingStream) Close() error                     { return nil }
+
+type delayedEventStream struct {
+	ctx     context.Context
+	delay   time.Duration
+	event   *httpclient.StreamEvent
+	emitted bool
+}
+
+func (s *delayedEventStream) Next() bool {
+	if !s.emitted {
+		time.Sleep(s.delay)
+		s.emitted = true
+
+		return true
+	}
+
+	<-s.ctx.Done()
+
+	return false
+}
+
+func (s *delayedEventStream) Current() *httpclient.StreamEvent { return s.event }
+func (s *delayedEventStream) Err() error                       { return nil }
+func (s *delayedEventStream) Close() error                     { return nil }
+
+type heartbeatTimeResponseWriter struct {
+	gin.ResponseWriter
+	heartbeatAt time.Time
+}
+
+func (w *heartbeatTimeResponseWriter) Write(data []byte) (int, error) {
+	if bytes.Equal(data, []byte(": ping\n\n")) {
+		w.heartbeatAt = time.Now()
+	}
+
+	return w.ResponseWriter.Write(data)
+}
+
 func (w *failingResponseWriter) Write(_ []byte) (int, error) {
 	w.writes++
 
@@ -133,6 +191,84 @@ func TestWriteSSEStream_Success(t *testing.T) {
 	body := w.Body.String()
 	assert.Contains(t, body, `{"id":"1","choices":[{"delta":{"content":"Hi"}}]}`)
 	assert.Contains(t, body, `[DONE]`)
+}
+
+func TestWriteSSEStream_WritesRawCommentAfterIdleTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/messages", nil).WithContext(ctx)
+		stream := &contextBlockingStream{ctx: ctx}
+		done := make(chan struct{})
+
+		go func() {
+			WriteSSEStream(c, stream)
+			close(done)
+		}()
+
+		time.Sleep(10 * time.Second)
+		cancel()
+		<-done
+
+		require.Contains(t, w.Body.String(), ": ping\n\n")
+	})
+}
+
+func TestWriteSSEStream_ReturnsWhenRequestCanceledWhileNextBlocked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/messages", nil).WithContext(ctx)
+		nextReturned := make(chan struct{})
+		stream := &contextBlockingStream{ctx: ctx, nextReturned: nextReturned}
+		done := make(chan struct{})
+
+		go func() {
+			WriteSSEStream(c, stream)
+			close(done)
+		}()
+
+		synctest.Wait()
+		cancel()
+		<-nextReturned
+		<-done
+
+		require.ErrorIs(t, ctx.Err(), context.Canceled)
+	})
+}
+
+func TestWriteSSEStream_ResetsHeartbeatTimeoutAfterEvent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const heartbeatTimeout = 9 * time.Second
+
+		ctx, cancel := context.WithCancel(t.Context())
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodGet, "/v1/messages", nil).WithContext(ctx)
+		timedWriter := &heartbeatTimeResponseWriter{ResponseWriter: c.Writer}
+		c.Writer = timedWriter
+		eventDelay := heartbeatTimeout - time.Second
+		stream := &delayedEventStream{
+			ctx:   ctx,
+			delay: eventDelay,
+			event: &httpclient.StreamEvent{Data: []byte("event")},
+		}
+		done := make(chan struct{})
+		start := time.Now()
+
+		go func() {
+			WriteSSEStream(c, stream)
+			close(done)
+		}()
+
+		time.Sleep(eventDelay + heartbeatTimeout + time.Second)
+		cancel()
+		<-done
+
+		require.Equal(t, eventDelay+heartbeatTimeout, timedWriter.heartbeatAt.Sub(start))
+	})
 }
 
 func TestWriteSSEStream_ErrorFormatsAsJSON(t *testing.T) {
