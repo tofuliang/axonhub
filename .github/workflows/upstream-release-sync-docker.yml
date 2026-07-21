@@ -1,0 +1,219 @@
+name: Upstream Release Sync & Docker Publish
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: 'Upstream repository (owner/name). Empty = parent fork repo'
+        required: false
+        type: string
+      patch_branch:
+        description: 'Branch that stores local patch commits'
+        required: false
+        default: 'feature/upstream-patches'
+        type: string
+      release_channel:
+        description: 'Which release stream to follow: stable | prerelease | any'
+        required: false
+        default: 'any'
+        type: choice
+        options:
+          - stable
+          - prerelease
+          - any
+      release_tag:
+        description: 'Optional exact release tag (e.g. v1.2.3). Empty = by channel'
+        required: false
+        type: string
+      force:
+        description: 'Force rebuild and retag even if already processed'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-release-sync-docker
+  cancel-in-progress: true
+
+jobs:
+  sync-build-publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      INPUT_UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo }}
+      INPUT_PATCH_BRANCH: ${{ github.event.inputs.patch_branch }}
+      INPUT_RELEASE_CHANNEL: ${{ github.event.inputs.release_channel }}
+      INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+      INPUT_FORCE: ${{ github.event.inputs.force }}
+      VAR_UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+      VAR_PATCH_BRANCH: ${{ vars.PATCH_BRANCH }}
+      VAR_RELEASE_CHANNEL: ${{ vars.RELEASE_CHANNEL }}
+      VAR_DOCKER_IMAGE: ${{ vars.DOCKER_IMAGE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve upstream and release
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${INPUT_UPSTREAM_REPO:-}" ]]; then
+            UPSTREAM_REPO="$INPUT_UPSTREAM_REPO"
+          elif [[ -n "${VAR_UPSTREAM_REPO:-}" ]]; then
+            UPSTREAM_REPO="$VAR_UPSTREAM_REPO"
+          else
+            UPSTREAM_REPO=$(curl -fsSL \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}" | jq -r '.parent.full_name // empty')
+          fi
+
+          if [[ -z "${UPSTREAM_REPO:-}" ]]; then
+            echo "Cannot resolve upstream repo. Set vars.UPSTREAM_REPO or workflow input upstream_repo."
+            exit 1
+          fi
+
+          PATCH_BRANCH="${INPUT_PATCH_BRANCH:-${VAR_PATCH_BRANCH:-feature/upstream-patches}}"
+          RELEASE_CHANNEL="${INPUT_RELEASE_CHANNEL:-${VAR_RELEASE_CHANNEL:-any}}"
+
+          if [[ "$RELEASE_CHANNEL" != "stable" && "$RELEASE_CHANNEL" != "prerelease" && "$RELEASE_CHANNEL" != "any" ]]; then
+            echo "Invalid release_channel: $RELEASE_CHANNEL"
+            exit 1
+          fi
+
+          if [[ -n "${INPUT_RELEASE_TAG:-}" ]]; then
+            UPSTREAM_TAG="$INPUT_RELEASE_TAG"
+          else
+            if [[ "$RELEASE_CHANNEL" == "stable" ]]; then
+              UPSTREAM_TAG=$(curl -fsSL \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | jq -r '.tag_name // empty')
+            else
+              RELEASES_JSON=$(curl -fsSL \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${UPSTREAM_REPO}/releases?per_page=100")
+              if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
+                UPSTREAM_TAG=$(printf '%s' "$RELEASES_JSON" | jq -r '[.[] | select(.prerelease == true and .draft == false)][0].tag_name // empty')
+              else
+                UPSTREAM_TAG=$(printf '%s' "$RELEASES_JSON" | jq -r '[.[] | select(.draft == false)][0].tag_name // empty')
+              fi
+            fi
+          fi
+
+          if [[ -z "${UPSTREAM_TAG:-}" ]]; then
+            echo "Cannot resolve upstream release tag."
+            exit 1
+          fi
+
+          SAFE_TAG=$(printf '%s' "$UPSTREAM_TAG" | sed -E 's/[^a-zA-Z0-9._-]+/-/g')
+          SYNC_TAG="upstream-sync/${SAFE_TAG}"
+
+          OWNER_LOWER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME="${VAR_DOCKER_IMAGE:-${OWNER_LOWER}/axonhub}"
+
+          echo "upstream_repo=$UPSTREAM_REPO" >> "$GITHUB_OUTPUT"
+          echo "patch_branch=$PATCH_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "sync_tag=$SYNC_TAG" >> "$GITHUB_OUTPUT"
+          echo "safe_tag=$SAFE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image_name=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+
+          if git ls-remote --tags origin "refs/tags/${SYNC_TAG}" | grep -q .; then
+            if [[ "${INPUT_FORCE:-false}" == "true" ]]; then
+              echo "should_sync=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "should_sync=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sync, patch, build and publish
+        if: steps.resolve.outputs.should_sync == 'true'
+        env:
+          UPSTREAM_REPO: ${{ steps.resolve.outputs.upstream_repo }}
+          PATCH_BRANCH: ${{ steps.resolve.outputs.patch_branch }}
+          UPSTREAM_TAG: ${{ steps.resolve.outputs.upstream_tag }}
+          SYNC_TAG: ${{ steps.resolve.outputs.sync_tag }}
+          SAFE_TAG: ${{ steps.resolve.outputs.safe_tag }}
+          IMAGE_NAME: ${{ steps.resolve.outputs.image_name }}
+        run: |
+          set -euo pipefail
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote remove upstream
+          fi
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+
+          TAG_REF="refs/upstream-release-tags/${SAFE_TAG}"
+          git fetch --force --no-tags upstream "refs/tags/${UPSTREAM_TAG}:${TAG_REF}"
+          git fetch origin "$PATCH_BRANCH"
+
+          BASE_COMMIT=$(git rev-parse "${TAG_REF}^{commit}")
+          echo "Using upstream tag commit: ${UPSTREAM_TAG} -> ${BASE_COMMIT}"
+          git checkout -B "upstream-sync-${SAFE_TAG}" "$BASE_COMMIT"
+
+          LOCAL_COMMITS=$(git rev-list --reverse --cherry-pick --right-only --no-merges "${BASE_COMMIT}...origin/${PATCH_BRANCH}")
+          if [[ -n "$LOCAL_COMMITS" ]]; then
+            while IFS= read -r commit; do
+              [[ -z "$commit" ]] && continue
+              git cherry-pick "$commit"
+            done <<< "$LOCAL_COMMITS"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.resolve.outputs.should_sync == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: steps.resolve.outputs.should_sync == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        if: steps.resolve.outputs.should_sync == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.resolve.outputs.image_name }}:${{ steps.resolve.outputs.upstream_tag }}
+            ${{ steps.resolve.outputs.image_name }}:upstream-${{ steps.resolve.outputs.safe_tag }}
+            ${{ steps.resolve.outputs.image_name }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+      - name: Mark synced release tag
+        if: steps.resolve.outputs.should_sync == 'true'
+        env:
+          SYNC_TAG: ${{ steps.resolve.outputs.sync_tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --tags origin "refs/tags/${SYNC_TAG}" | grep -q .; then
+            git push --force origin "HEAD:refs/tags/${SYNC_TAG}"
+          else
+            git tag -a "$SYNC_TAG" -m "Synced upstream release ${SYNC_TAG}" HEAD
+            git push origin "$SYNC_TAG"
+          fi
